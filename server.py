@@ -122,6 +122,59 @@ GEMINI_MODELS = [
     "gemini-2.5-pro"
 ]
 
+
+def _openai_model_id(litellm_model: str) -> str:
+    m = litellm_model or ""
+    if m.startswith("openai/"):
+        m = m[7:]
+    return m.lower()
+
+
+def _is_moonshot_openai_base() -> bool:
+    return "moonshot" in (OPENAI_BASE_URL or "").lower()
+
+
+def _apply_moonshot_kimi_extra_body(litellm_request: Dict[str, Any]) -> None:
+    """Kimi K2.x uses thinking in the JSON body; OpenAI-compatible clients pass it via extra_body.
+
+    Default KIMI_THINKING=disabled — recommended when using tool calls / agents.
+    Set KIMI_THINKING=enabled for deep thinking, or omit to skip sending the field.
+    """
+    model = litellm_request.get("model") or ""
+    if not str(model).startswith("openai/"):
+        return
+    if not _is_moonshot_openai_base():
+        return
+    if not _openai_model_id(str(model)).startswith("kimi"):
+        return
+    mode = os.environ.get("KIMI_THINKING", "disabled").strip().lower()
+    if mode in ("omit", "none", "skip"):
+        return
+    if mode not in ("enabled", "disabled"):
+        mode = "disabled"
+    extra = dict(litellm_request.get("extra_body") or {})
+    extra["thinking"] = {"type": mode}
+    litellm_request["extra_body"] = extra
+    logger.debug("Moonshot Kimi extra_body: thinking=%s", extra["thinking"])
+
+
+def _apply_moonshot_kimi_temperature(litellm_request: Dict[str, Any]) -> None:
+    """Moonshot Kimi K2.x may reject arbitrary temperature (e.g. only 0.6 allowed)."""
+    model = litellm_request.get("model") or ""
+    if not str(model).startswith("openai/"):
+        return
+    if not _is_moonshot_openai_base():
+        return
+    if not _openai_model_id(str(model)).startswith("kimi"):
+        return
+    raw = os.environ.get("KIMI_TEMPERATURE", "0.6").strip()
+    try:
+        litellm_request["temperature"] = float(raw)
+    except ValueError:
+        litellm_request["temperature"] = 0.6
+    logger.debug("Moonshot Kimi temperature clamped to %s", litellm_request["temperature"])
+
+
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
     """Recursively removes unsupported fields from a JSON schema for Gemini."""
@@ -648,8 +701,14 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
         
-        # Check if this is a Claude model (which supports content blocks)
-        is_claude_model = clean_model.startswith("claude-")
+        # Anthropic /v1/messages clients (e.g. Claude Code) expect tool_use blocks. LiteLLM
+        # returns tool_calls for OpenAI-compat providers (Kimi/Moonshot, etc.); those model
+        # names are not claude-*, so we must still map tool_calls → tool_use here.
+        emit_tool_use_blocks = (
+            clean_model.startswith("claude-")
+            or original_request.model.startswith("openai/")
+            or original_request.model.startswith("gemini/")
+        )
         
         # Handle ModelResponse object from LiteLLM
         if hasattr(litellm_response, 'choices') and hasattr(litellm_response, 'usage'):
@@ -694,8 +753,8 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         if content_text is not None and content_text != "":
             content.append({"type": "text", "text": content_text})
         
-        # Add tool calls if present (tool_use in Anthropic format) - only for Claude models
-        if tool_calls and is_claude_model:
+        # Add tool calls if present (tool_use in Anthropic format)
+        if tool_calls and emit_tool_use_blocks:
             logger.debug(f"Processing tool calls: {tool_calls}")
             
             # Convert to list if it's not already
@@ -733,31 +792,21 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                     "name": name,
                     "input": arguments
                 })
-        elif tool_calls and not is_claude_model:
-            # For non-Claude models, convert tool calls to text format
-            logger.debug(f"Converting tool calls to text for non-Claude model: {clean_model}")
-            
-            # We'll append tool info to the text content
+        elif tool_calls and not emit_tool_use_blocks:
+            # Rare: unprefixed / unknown provider — keep text fallback for debugging
+            logger.debug(f"Converting tool calls to text for model: {clean_model}")
             tool_text = "\n\nTool usage:\n"
-            
-            # Convert to list if it's not already
             if not isinstance(tool_calls, list):
                 tool_calls = [tool_calls]
-                
-            for idx, tool_call in enumerate(tool_calls):
-                # Extract function data based on whether it's a dict or object
+            for tool_call in tool_calls:
                 if isinstance(tool_call, dict):
                     function = tool_call.get("function", {})
-                    tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
                     name = function.get("name", "")
                     arguments = function.get("arguments", "{}")
                 else:
                     function = getattr(tool_call, "function", None)
-                    tool_id = getattr(tool_call, "id", f"tool_{uuid.uuid4()}")
                     name = getattr(function, "name", "") if function else ""
                     arguments = getattr(function, "arguments", "{}") if function else "{}"
-                
-                # Convert string arguments to dict if needed
                 if isinstance(arguments, str):
                     try:
                         args_dict = json.loads(arguments)
@@ -766,10 +815,7 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                         arguments_str = arguments
                 else:
                     arguments_str = json.dumps(arguments, indent=2)
-                
                 tool_text += f"Tool: {name}\nArguments: {arguments_str}\n\n"
-            
-            # Add or append tool text to content
             if content and content[0]["type"] == "text":
                 content[0]["text"] += tool_text
             else:
@@ -1281,6 +1327,9 @@ async def create_message(
                 elif msg.get("content") is None:
                     logger.warning(f"Message {i} has None content - replacing with placeholder")
                     litellm_request["messages"][i]["content"] = "..." # Fallback placeholder
+        
+        _apply_moonshot_kimi_extra_body(litellm_request)
+        _apply_moonshot_kimi_temperature(litellm_request)
         
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
