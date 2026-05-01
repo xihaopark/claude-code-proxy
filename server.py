@@ -18,12 +18,22 @@ import sys
 # Load environment variables from .env file
 load_dotenv()
 
-# Configure logging
+_PROXY_LOG_LEVEL_NAME = os.environ.get("PROXY_LOG_LEVEL", "WARNING").strip().upper()
+_PROXY_LOG_LEVEL = getattr(logging, _PROXY_LOG_LEVEL_NAME, logging.WARNING)
+
+# Configure logging (PROXY_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR)
 logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=_PROXY_LOG_LEVEL,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
+logging.getLogger().setLevel(_PROXY_LOG_LEVEL)
 logger = logging.getLogger(__name__)
+logger.setLevel(_PROXY_LOG_LEVEL)
+
+# Unless PROXY_LITELLM_DEBUG=1, keep LiteLLM / HTTP stacks quieter (very noisy at DEBUG)
+if os.environ.get("PROXY_LITELLM_DEBUG", "").lower() not in ("1", "true", "yes"):
+    for _lg in ("LiteLLM", "openai", "httpcore", "httpx"):
+        logging.getLogger(_lg).setLevel(logging.WARNING)
 
 # Configure uvicorn to be quieter
 import uvicorn
@@ -173,6 +183,53 @@ def _apply_moonshot_kimi_temperature(litellm_request: Dict[str, Any]) -> None:
     except ValueError:
         litellm_request["temperature"] = 0.6
     logger.debug("Moonshot Kimi temperature clamped to %s", litellm_request["temperature"])
+
+
+def _log_litellm_outgoing(litellm_request: Dict[str, Any]) -> None:
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    snap: Dict[str, Any] = {
+        "model": litellm_request.get("model"),
+        "stream": litellm_request.get("stream"),
+        "temperature": litellm_request.get("temperature"),
+        "max_completion_tokens": litellm_request.get("max_completion_tokens"),
+        "tool_choice": litellm_request.get("tool_choice"),
+        "extra_body": litellm_request.get("extra_body"),
+        "n_messages": len(litellm_request.get("messages") or []),
+        "n_tools": len(litellm_request.get("tools") or []),
+    }
+    logger.info("OUTGOING litellm %s", json.dumps(snap, default=str, ensure_ascii=False))
+
+
+def _summarize_content_blocks(content: List[Any], stop_reason: Optional[str], upstream_finish: Any) -> str:
+    types: List[str] = []
+    tool_names: List[str] = []
+    text_chars = 0
+    for b in content:
+        if isinstance(b, dict):
+            d = b
+        elif hasattr(b, "model_dump"):
+            d = b.model_dump()
+        elif hasattr(b, "dict"):
+            d = b.dict()
+        else:
+            d = {"type": "unknown"}
+        t = str(d.get("type", "?"))
+        types.append(t)
+        if t == "text":
+            text_chars += len(d.get("text") or "")
+        elif t == "tool_use":
+            tool_names.append(str(d.get("name") or ""))
+    return json.dumps(
+        {
+            "upstream_finish_reason": upstream_finish,
+            "stop_reason": stop_reason,
+            "block_types": types,
+            "tool_names": tool_names,
+            "text_chars": text_chars,
+        },
+        ensure_ascii=False,
+    )
 
 
 # Helper function to clean schema for Gemini
@@ -857,7 +914,10 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                 output_tokens=completion_tokens
             )
         )
-        
+        logger.info(
+            "RESPONSE non-stream %s",
+            _summarize_content_blocks(content, stop_reason, finish_reason),
+        )
         return anthropic_response
         
     except Exception as e:
@@ -918,6 +978,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         output_tokens = 0
         has_sent_stop_reason = False
         last_tool_index = 0
+        stream_tool_names: List[str] = []
         
         # Process each chunk
         async for chunk in response_generator:
@@ -1025,6 +1086,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                     name = getattr(function, 'name', '') if function else ''
                                     tool_id = getattr(tool_call, 'id', f"toolu_{uuid.uuid4().hex[:24]}")
                                 
+                                stream_tool_names.append(name or "(unnamed)")
                                 # Start a new tool_use block
                                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
                                 current_tool_call = tool_call
@@ -1086,6 +1148,15 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         elif finish_reason == "stop":
                             stop_reason = "end_turn"
                         
+                        logger.info(
+                            "RESPONSE stream end (finish in-chunk) finish=%s stop=%s text_chars=%d tools=%s out_tok=%s",
+                            finish_reason,
+                            stop_reason,
+                            len(accumulated_text),
+                            stream_tool_names,
+                            output_tokens,
+                        )
+                        
                         # Send message_delta with stop reason and usage
                         usage = {"output_tokens": output_tokens}
                         
@@ -1104,6 +1175,12 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         
         # If we didn't get a finish reason, close any open blocks
         if not has_sent_stop_reason:
+            logger.info(
+                "RESPONSE stream end (no chunk finish_reason) text_chars=%d tools=%s out_tok=%s",
+                len(accumulated_text),
+                stream_tool_names,
+                output_tokens,
+            )
             # Close any open tool call blocks
             if tool_index is not None:
                 for i in range(1, last_tool_index + 1):
@@ -1330,6 +1407,7 @@ async def create_message(
         
         _apply_moonshot_kimi_extra_body(litellm_request)
         _apply_moonshot_kimi_temperature(litellm_request)
+        _log_litellm_outgoing(litellm_request)
         
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
